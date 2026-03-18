@@ -1,0 +1,163 @@
+@startuml
+title Laboratorio CI/CD - Secuencia (Jenkins -> Build -> Nexus -> Deploy -> Smoke)
+
+'--- Estilo (opcional, pero ayuda mucho a leer)
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #2C3E50
+  LifeLineBorderColor #95A5A6
+  LifeLineBackgroundColor #FFFFFF
+  ParticipantBorderColor #34495E
+  ParticipantBackgroundColor #ECF0F1
+  BoxBorderColor #34495E
+  BoxBackgroundColor #F8F9F9
+  GroupBorderColor #BDC3C7
+  GroupBackgroundColor #FBFCFC
+}
+
+actor Dev as "Developer"
+participant "Git (local)" as GitLocal
+participant "GitHub (remote repo)" as GitHub
+participant "Jenkins Controller" as Jenkins
+participant "Jenkins Agent\n(agent-maven-2)" as Agent
+participant "Maven" as Maven
+database "Maven Central" as Central
+participant "Nexus\n(Maven Repo + Docker Registry)\nlocalhost:8082" as Nexus <<node>>
+participant "Docker Engine" as Docker
+participant "Docker Compose" as Compose
+participant "DESA Host\n(/deploy/desa)" as DesaHost <<host>>
+participant "Container: hola-mundo-desa\n(Spring Boot)" as AppCtn <<container>>
+database "Container: pg-desa\n(PostgreSQL 16)" as PgCtn <<container>>
+
+note over Dev,GitHub
+Repositorio: app + Jenkinsfile + docker-compose.yml
+Estrategia: build inmutable (tag por commit)
+end note
+
+== 1) Commit & Trigger ==
+Dev -> GitLocal : commit
+Dev -> GitLocal : git push
+GitLocal -> GitHub : git push (SSH)
+
+opt Webhook / Poll SCM
+GitHub -> Jenkins : notify / Jenkins detecta cambio
+end opt
+
+== 2) Orquestación Jenkins ==
+Dev -> Jenkins : Run pipeline (ENV=desa)
+activate Jenkins
+Jenkins -> Agent : schedule job on agent
+activate Agent
+
+note right of Agent
+Workspace limpio
+Variables típicas:
+- GIT_COMMIT
+- APP_VERSION / IMAGE_TAG
+- ENV=desa
+end note
+
+== 3) Checkout ==
+Agent -> GitHub : git fetch / checkout main@<commit>
+GitHub --> Agent : código fuente
+
+== 4) Build Maven ==
+group Build + Unit tests
+Agent -> Maven : mvn -B clean test package
+activate Maven
+Maven -> Central : resolve dependencias
+Central --> Maven : jars/poms
+Maven --> Agent : target/app.jar
+deactivate Maven
+end group
+
+note right of Agent
+Artefacto generado:
+- target/app.jar
+end note
+
+== 5) Publicación a Nexus (Maven) ==
+opt Publicar artefacto (si aplica)
+Agent -> Nexus : mvn deploy (repo releases/snapshots)
+Nexus --> Agent : 201 Created / OK
+end opt
+
+== 6) Build & Push imagen Docker ==
+group Imagen Docker (tag inmutable)
+Agent -> Docker : docker build -t nexus/app:${IMAGE_TAG} .
+Docker --> Agent : imagen creada
+Agent -> Nexus : docker login (credenciales Jenkins)
+Nexus --> Agent : login ok
+Agent -> Nexus : docker push nexus/app:${IMAGE_TAG}
+Nexus --> Agent : push ok (digest sha256:...)
+end group
+
+note over Agent,Nexus
+Buenas prácticas:
+- Tag: commit corto (ej. 82725b6)
+- Opcional: "latest" solo para dev
+end note
+
+== 7) Deploy en DESA (Compose) ==
+group Despliegue
+Agent -> DesaHost : ssh: cd /deploy/desa
+Agent -> Compose : docker compose pull
+Compose -> Nexus : pull nexus/app:${IMAGE_TAG}
+Nexus --> Compose : layers ok
+Compose -> Docker : docker compose up -d
+Docker --> Compose : contenedores (re)creados
+end group
+
+note right of Compose
+docker-compose.yml referencia:
+image: nexus/app:${IMAGE_TAG}
+Variables por ENV (desa):
+- DB_URL
+- DB_USER/PASS (secrets)
+end note
+
+== 8) Arranque + DB ==
+Docker -> PgCtn : start postgres
+Docker -> AppCtn : start java -jar app.jar
+AppCtn -> PgCtn : JDBC connect
+AppCtn -> PgCtn : Flyway migrate
+
+alt Migración OK
+PgCtn --> AppCtn : OK
+else Migración falla
+PgCtn --> AppCtn : error
+note right of AppCtn
+Síntoma típico:
+- crash / restart loop
+- logs con SQL error
+end note
+end alt
+
+== 9) Smoke test ==
+group Verificación
+Agent -> Docker : docker exec app wget -qO- http://localhost:8080/health
+Docker -> AppCtn : HTTP GET /health
+AppCtn --> Docker : 200 OK
+Docker --> Agent : salida OK
+end group
+
+alt Smoke OK
+Agent --> Jenkins : SUCCESS
+else Smoke falla
+Agent --> Jenkins : FAILURE
+group Rollback (opcional)
+Agent -> Compose : docker compose down
+note right of Compose
+Rollback por etiqueta anterior:
+IMAGE_TAG=prev
+docker compose up -d
+end note
+end group
+end alt
+
+deactivate Agent
+deactivate Jenkins
+
+@enduml

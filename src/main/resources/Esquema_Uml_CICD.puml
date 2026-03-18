@@ -1,0 +1,21 @@
+@startuml
+title Laboratorio CI/CD - Secuencia (Jenkins -> Build -> Nexus -> Deploy -> Smoke)
+
+actor Dev as "Developer"
+participant "Git (local)" as GitLocal
+participant "GitHub (remote repo)" as GitHub
+participant "Jenkins Controller" as Jenkins
+participant "Jenkins Agent\n(agent-maven-2)" as Agent
+participant "Maven" as Maven
+database "Maven Central" as Central
+participant "Nexus\n(Maven Repo + Docker Registry)\nlocalhost:8082" as Nexus
+participant "Docker Engine" as Docker
+participant "Docker Compose" as Compose
+participant "DESA Host\n(/deploy/desa)" as DesaHost
+participant "Container: hola-mundo-desa\n(Spring Boot)" as AppCtn
+database "Container: pg-desa\n(PostgreSQL 16)" as PgCtn
+
+Dev -> GitLocal : commit/push
+GitLocal -> GitHub : git push (SSH)
+
+@enduml
